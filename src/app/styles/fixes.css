@@ -1,0 +1,128 @@
+/* =============================================================================
+   Fixes on top of the v63 design (loads after v63.css).
+   Each block names the review finding it fixes. Same look, broken bits fixed.
+   ============================================================================= */
+
+/* --- Links that look like buttons ------------------------------------------
+   v63 used <button> + JavaScript for every navigation. The rebuild uses real
+   links (keyboard, middle-click, back button all work), styled identically. */
+a.btn,
+a.text-btn,
+a.v52-action,
+a.staff-chip {
+  text-decoration: none;
+  cursor: pointer;
+}
+a.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 44px;
+}
+a.btn.full { display: flex; }
+nav a { text-decoration: none; }
+a.text-btn { display: inline-block; }
+
+/* --- Review UI: phone tab bar showed its own little scrollbar ---------------
+   The bar's content was 2px taller than the bar. */
+@media (max-width: 1024px) {
+  #mobile-bottom-nav { overflow: hidden; }
+}
+/* v63 fixed the phone bar at 68px; let it grow to fit its content instead. */
+@media (max-width: 700px) {
+  #mobile-bottom-nav {
+    height: auto !important;
+    min-height: calc(68px + env(safe-area-inset-bottom)) !important;
+  }
+}
+
+/* --- Review UI: cart line totals and +/− buttons didn't line up -------------
+   Every cart row is now the same three-column grid (item | quantity | total),
+   on desktop and phone, so the buttons and totals sit in one column. */
+.cart-line {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto minmax(84px, auto);
+  align-items: center !important;
+  column-gap: 18px;
+}
+.cart-line > strong { text-align: right; }
+@media (max-width: 700px) {
+  .cart-line {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 8px;
+  }
+  .cart-line > div:first-child { grid-column: 1 / -1; }
+  .cart-line > strong { justify-self: end; }
+}
+
+/* --- Review UI: 👋 dropped onto its own line on phones ----------------------
+   The first name and the emoji are kept together. */
+.nowrap { white-space: nowrap; }
+
+/* --- Review UI: sidebar logo ran past the edge of the portal sidebar --------
+   In the (narrower) portal sidebar the word CANTEEN sits under the logo. */
+body:not(.staff) aside .punch-brand-logo {
+  flex-wrap: wrap !important;
+  row-gap: 6px !important;
+  max-width: 100%;
+}
+body:not(.staff) aside .punch-brand-logo img { max-width: 100% !important; }
+/* Blue-on-green failed contrast in the dark portal sidebar. */
+body:not(.staff) aside .punch-brand-logo .canteen-word { color: #fff !important; }
+
+/* --- Review N11: System Maintenance checkbox labels sat far from boxes ------ */
+.check-line {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 0;
+  font-weight: 600;
+}
+.check-line input[type="checkbox"] {
+  width: auto;
+  min-height: 0 !important;
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+/* --- Manage menu: inputs stretched to the height of the photo preview ------- */
+.menu-edit .field { align-content: start; }
+
+/* --- Tickets that have been collected are shown as used --------------------- */
+.digital-ticket.used { border-color: #8a929b !important; filter: saturate(0.35); }
+.digital-ticket.used .ticket-top { background: #6b737c !important; }
+.digital-ticket.used .ticket-top > b { color: #6b737c !important; }
+
+/* --- Status tags that v63 never needed -------------------------------------- */
+.tag.warn { background: #fff2dd !important; color: #86601e !important; }
+.tag.red { background: var(--punch-red-soft) !important; color: var(--punch-red-dark) !important; }
+.transfer-status.pending { background: #fff4d8; color: #875f00; }
+
+/* --- Toast: shown/hidden from React instead of style.display ---------------- */
+#toast.show { display: block; }
+
+/* --- Small helpers for messages and loading states -------------------------- */
+.form-error { color: #ba2536; font-size: 14px; margin-top: 10px; }
+.form-success { color: #253c37; font-size: 14px; margin-top: 10px; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.skeleton {
+  background: linear-gradient(90deg, #eef1f4 25%, #f6f8fa 37%, #eef1f4 63%);
+  background-size: 400% 100%;
+  animation: pc-shimmer 1.3s ease infinite;
+  border-radius: 10px;
+}
+@keyframes pc-shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+
+/* --- Honour reduced-motion everywhere (convention #16) ---------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

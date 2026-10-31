@@ -1,0 +1,483 @@
+// =============================================================================
+// PUNCH Canteen — database schema (PostgreSQL)
+// -----------------------------------------------------------------------------
+// Rebuild of the v63 Supabase schema. Key differences from v63:
+//  * One `users` table replaces `staff_directory` + `profiles` (they held the
+//    same person twice and were kept in sync by a trigger).
+//  * All money is stored in KOBO as integers (₦2,500 = 250000). Never floats.
+//  * Orders store how much came from the Weekly Ticket and the Personal Wallet
+//    (v63 labelled split payments as just "wallet").
+//  * Orders have a real "collected" step, so a ticket can't be used twice.
+//  * Every balance change writes a `transactions` row (the ledger), including
+//    month-end expiries and admin resets, with the balance after the change.
+//  * Reviews link to the order they came from.
+//  * Chat records who actually sent each message.
+//  * Sign-in is our own magic link (login_tokens + sessions), not Supabase Auth.
+//  * Admin changes are written to `audit_logs`.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ----------------------------------------------------------------------------
+// People
+// ----------------------------------------------------------------------------
+
+enum Role {
+  staff
+  operator
+  admin
+}
+
+/// invited  = pre-approved by an admin, has never signed in
+/// active   = has signed in at least once and may use the canteen
+/// suspended / deactivated = may not sign in; history is kept
+enum AccountStatus {
+  invited
+  active
+  suspended
+  deactivated
+}
+
+/// A pre-approved PUNCH employee. Only emails in this table can sign in.
+model User {
+  id               String        @id @default(uuid()) @db.Uuid
+  fullName         String        @map("full_name")
+  /// Always stored lower-case (see lib/validation `email`).
+  email            String        @unique
+  role             Role          @default(staff)
+  status           AccountStatus @default(invited)
+  /// The master administrator can never be demoted, suspended or removed.
+  isMaster         Boolean       @default(false) @map("is_master")
+  /// Company meal benefit, in kobo. Expires at month end.
+  weeklyTicketKobo Int           @default(0) @map("weekly_ticket_kobo")
+  /// The person's own money (bank top-ups), in kobo. Never expires.
+  walletKobo       Int           @default(0) @map("wallet_kobo")
+  activatedAt      DateTime?     @map("activated_at") @db.Timestamptz
+  lastSignInAt     DateTime?     @map("last_sign_in_at") @db.Timestamptz
+  /// Soft removal: the person disappears from the directory but their
+  /// orders and transactions stay intact.
+  removedAt        DateTime?     @map("removed_at") @db.Timestamptz
+  createdById      String?       @map("created_by_id") @db.Uuid
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz
+
+  createdBy         User?              @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers      User[]             @relation("UserCreatedBy")
+  orders            Order[]            @relation("OrderUser")
+  handledOrders     Order[]            @relation("OrderHandledBy")
+  topups            WalletTopup[]      @relation("TopupUser")
+  decidedTopups     WalletTopup[]      @relation("TopupDecidedBy")
+  transactions      Transaction[]      @relation("TransactionUser")
+  createdTx         Transaction[]      @relation("TransactionCreatedBy")
+  reviews           Review[]
+  experienceReviews ExperienceReview[]
+  chatConversation  ChatMessage[]      @relation("ChatConversation")
+  chatSent          ChatMessage[]      @relation("ChatSender")
+  readReceipts      ChatReadReceipt[]  @relation("ReceiptViewer")
+  readByOthers      ChatReadReceipt[]  @relation("ReceiptConversation")
+  confirmedGuests   GuestOrder[]
+  expiries          WeeklyTicketExpiry[]
+  sessions          Session[]
+  loginTokens       LoginToken[]
+  auditLogs         AuditLog[]
+  settingsUpdates   CanteenSettings[]
+
+  @@index([role, status])
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// Sign-in (magic link)
+// ----------------------------------------------------------------------------
+
+/// One-time sign-in link. Only the SHA-256 hash of the token is stored.
+model LoginToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  userId    String    @map("user_id") @db.Uuid
+  /// Where to land after sign-in (e.g. /operator). Carried inside the link,
+  /// so it survives the email opening in a new tab.
+  nextPath  String?   @map("next_path")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz
+  usedAt    DateTime? @map("used_at") @db.Timestamptz
+  ip        String?
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("login_tokens")
+}
+
+/// A signed-in browser. The cookie holds a random token; we store its hash.
+model Session {
+  id         String   @id // SHA-256 of the cookie token
+  userId     String   @map("user_id") @db.Uuid
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz
+  lastSeenAt DateTime @default(now()) @map("last_seen_at") @db.Timestamptz
+  userAgent  String?  @map("user_agent")
+  ip         String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ----------------------------------------------------------------------------
+// Menu
+// ----------------------------------------------------------------------------
+
+enum MenuCategory {
+  Meals
+  Drinks
+}
+
+model MenuItem {
+  id          Int          @id @default(autoincrement())
+  name        String
+  description String?
+  priceKobo   Int          @map("price_kobo")
+  allergens   String?
+  category    MenuCategory @default(Meals)
+  /// File name inside the menu photo store (served at /media/menu/<file>).
+  imageFile   String?      @map("image_file")
+  available   Boolean      @default(true)
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz
+
+  orderItems      OrderItem[]
+  guestOrderItems GuestOrderItem[]
+  reviews         Review[]
+  specialFor      CanteenSettings[]
+
+  @@map("menu_items")
+}
+
+/// Single-row table (id = 1) for canteen-wide settings.
+model CanteenSettings {
+  id                     Int       @id @default(1)
+  todaysSpecialItemId    Int?      @map("todays_special_item_id")
+  bankName               String    @default("Moniepoint Bank") @map("bank_name")
+  bankAccountNumber      String    @default("5078623822") @map("bank_account_number")
+  bankAccountName        String    @default("MJ Kitchen") @map("bank_account_name")
+  updatedById            String?   @map("updated_by_id") @db.Uuid
+  updatedAt              DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+
+  todaysSpecial MenuItem? @relation(fields: [todaysSpecialItemId], references: [id], onDelete: SetNull)
+  updatedBy     User?     @relation(fields: [updatedById], references: [id])
+
+  @@map("canteen_settings")
+}
+
+// ----------------------------------------------------------------------------
+// Staff orders
+// ----------------------------------------------------------------------------
+
+/// received -> ready -> collected; received/ready -> cancelled (refunds).
+enum OrderStatus {
+  received
+  ready
+  collected
+  cancelled
+}
+
+model Order {
+  id               Int         @id @default(autoincrement())
+  userId           String      @map("user_id") @db.Uuid
+  totalKobo        Int         @map("total_kobo")
+  /// How much of the total came from each balance (always sums to totalKobo).
+  weeklyTicketKobo Int         @map("weekly_ticket_kobo")
+  walletKobo       Int         @map("wallet_kobo")
+  status           OrderStatus @default(received)
+  ticketNumber     String      @unique @map("ticket_number")
+  readyAt          DateTime?   @map("ready_at") @db.Timestamptz
+  collectedAt      DateTime?   @map("collected_at") @db.Timestamptz
+  cancelledAt      DateTime?   @map("cancelled_at") @db.Timestamptz
+  /// The operator who last moved the order on.
+  handledById      String?     @map("handled_by_id") @db.Uuid
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt        DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  user         User          @relation("OrderUser", fields: [userId], references: [id])
+  handledBy    User?         @relation("OrderHandledBy", fields: [handledById], references: [id])
+  items        OrderItem[]
+  transactions Transaction[]
+  reviews      Review[]
+
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id            Int     @id @default(autoincrement())
+  orderId       Int     @map("order_id")
+  menuItemId    Int?    @map("menu_item_id")
+  /// Name and price are copied at order time so later menu edits don't
+  /// rewrite history.
+  itemName      String  @map("item_name")
+  unitPriceKobo Int     @map("unit_price_kobo")
+  quantity      Int
+  subtotalKobo  Int     @map("subtotal_kobo")
+
+  order    Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem? @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+// ----------------------------------------------------------------------------
+// Wallet top-ups and the money ledger
+// ----------------------------------------------------------------------------
+
+enum TopupStatus {
+  pending
+  confirmed
+  rejected
+}
+
+model WalletTopup {
+  id              Int         @id @default(autoincrement())
+  userId          String      @map("user_id") @db.Uuid
+  amountKobo      Int         @map("amount_kobo")
+  reference       String      @unique
+  status          TopupStatus @default(pending)
+  rejectionReason String?     @map("rejection_reason")
+  decidedById     String?     @map("decided_by_id") @db.Uuid
+  decidedAt       DateTime?   @map("decided_at") @db.Timestamptz
+  requestedAt     DateTime    @default(now()) @map("requested_at") @db.Timestamptz
+
+  user         User          @relation("TopupUser", fields: [userId], references: [id])
+  decidedBy    User?         @relation("TopupDecidedBy", fields: [decidedById], references: [id])
+  transactions Transaction[]
+
+  @@index([status, requestedAt])
+  @@index([userId, requestedAt])
+  @@map("wallet_topups")
+}
+
+enum TransactionType {
+  weekly_ticket_credit
+  wallet_topup
+  order_payment
+  order_refund
+  weekly_ticket_expiry
+  balance_reset
+  /// Carried-over balance after test/transaction history was cleared (test environments only).
+  opening_balance
+}
+
+enum Account {
+  weekly_ticket
+  wallet
+}
+
+/// The ledger. Every change to a user's balances writes one row per account,
+/// so the sum of `amountKobo` per (user, account) always equals the balance.
+model Transaction {
+  id               Int             @id @default(autoincrement())
+  userId           String          @map("user_id") @db.Uuid
+  type             TransactionType
+  account          Account
+  /// Signed: credits positive, debits negative.
+  amountKobo       Int             @map("amount_kobo")
+  balanceAfterKobo Int             @map("balance_after_kobo")
+  reference        String?
+  description      String
+  orderId          Int?            @map("order_id")
+  topupId          Int?            @map("topup_id")
+  createdById      String?         @map("created_by_id") @db.Uuid
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz
+
+  user      User         @relation("TransactionUser", fields: [userId], references: [id])
+  createdBy User?        @relation("TransactionCreatedBy", fields: [createdById], references: [id])
+  order     Order?       @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  topup     WalletTopup? @relation(fields: [topupId], references: [id], onDelete: SetNull)
+
+  @@index([userId, account, createdAt])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+/// One row per person per month whose unused Weekly Ticket was forfeited.
+model WeeklyTicketExpiry {
+  id          Int      @id @default(autoincrement())
+  userId      String   @map("user_id") @db.Uuid
+  /// First day of the month that expired (Africa/Lagos).
+  expiryMonth DateTime @map("expiry_month") @db.Date
+  amountKobo  Int      @map("amount_kobo")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, expiryMonth])
+  @@map("weekly_ticket_expiries")
+}
+
+// ----------------------------------------------------------------------------
+// Reviews
+// ----------------------------------------------------------------------------
+
+/// A food review must come from an order that contained the item.
+model Review {
+  id         Int      @id @default(autoincrement())
+  userId     String   @map("user_id") @db.Uuid
+  orderId    Int      @map("order_id")
+  menuItemId Int      @map("menu_item_id")
+  rating     Int
+  comment    String?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user     User     @relation(fields: [userId], references: [id])
+  order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("reviews")
+}
+
+model ExperienceReview {
+  id                     Int      @id @default(autoincrement())
+  userId                 String   @map("user_id") @db.Uuid
+  environmentRating      Int      @map("environment_rating")
+  restroomRating         Int      @map("restroom_rating")
+  ambienceRating         Int      @map("ambience_rating")
+  customerServiceRating  Int      @map("customer_service_rating")
+  speedOfServiceRating   Int      @map("speed_of_service_rating")
+  foodPresentationRating Int      @map("food_presentation_rating")
+  overallRating          Int      @map("overall_rating")
+  comment                String?
+  createdAt              DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@map("experience_reviews")
+}
+
+// ----------------------------------------------------------------------------
+// Canteen chat (one conversation per staff member)
+// ----------------------------------------------------------------------------
+
+model ChatMessage {
+  id                 Int      @id @default(autoincrement())
+  /// The staff member whose conversation this belongs to.
+  conversationUserId String   @map("conversation_user_id") @db.Uuid
+  /// Who actually wrote it (the staff member, or a named operator/admin).
+  senderId           String   @map("sender_id") @db.Uuid
+  senderRole         Role     @map("sender_role")
+  message            String
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  conversationUser User @relation("ChatConversation", fields: [conversationUserId], references: [id])
+  sender           User @relation("ChatSender", fields: [senderId], references: [id])
+
+  @@index([conversationUserId, id])
+  @@map("chat_messages")
+}
+
+model ChatReadReceipt {
+  viewerId           String   @map("viewer_id") @db.Uuid
+  conversationUserId String   @map("conversation_user_id") @db.Uuid
+  lastReadMessageId  Int      @default(0) @map("last_read_message_id")
+  updatedAt          DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  viewer           User @relation("ReceiptViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  conversationUser User @relation("ReceiptConversation", fields: [conversationUserId], references: [id], onDelete: Cascade)
+
+  @@id([viewerId, conversationUserId])
+  @@map("chat_read_receipts")
+}
+
+// ----------------------------------------------------------------------------
+// Guest orders (visitors pay by bank transfer; operator confirms)
+// ----------------------------------------------------------------------------
+
+enum GuestPaymentStatus {
+  pending
+  confirmed
+  rejected
+}
+
+enum GuestOrderStatus {
+  awaiting_payment
+  received
+  ready
+  collected
+  cancelled
+}
+
+model GuestOrder {
+  id               Int                @id @default(autoincrement())
+  guestName        String             @map("guest_name")
+  phoneNumber      String             @map("phone_number")
+  totalKobo        Int                @map("total_kobo")
+  paymentReference String             @unique @map("payment_reference")
+  paymentStatus    GuestPaymentStatus @default(pending) @map("payment_status")
+  orderStatus      GuestOrderStatus   @default(awaiting_payment) @map("order_status")
+  ticketNumber     String?            @unique @map("ticket_number")
+  rejectionReason  String?            @map("rejection_reason")
+  confirmedById    String?            @map("confirmed_by_id") @db.Uuid
+  confirmedAt      DateTime?          @map("confirmed_at") @db.Timestamptz
+  readyAt          DateTime?          @map("ready_at") @db.Timestamptz
+  collectedAt      DateTime?          @map("collected_at") @db.Timestamptz
+  /// Hash of the requester's IP, for rate limiting anonymous orders.
+  ipHash           String?            @map("ip_hash")
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz
+
+  confirmedBy User?            @relation(fields: [confirmedById], references: [id])
+  items       GuestOrderItem[]
+
+  @@index([paymentStatus, createdAt])
+  @@index([ipHash, createdAt])
+  @@map("guest_orders")
+}
+
+model GuestOrderItem {
+  id            Int    @id @default(autoincrement())
+  guestOrderId  Int    @map("guest_order_id")
+  menuItemId    Int?   @map("menu_item_id")
+  itemName      String @map("item_name")
+  unitPriceKobo Int    @map("unit_price_kobo")
+  quantity      Int
+  subtotalKobo  Int    @map("subtotal_kobo")
+
+  guestOrder GuestOrder @relation(fields: [guestOrderId], references: [id], onDelete: Cascade)
+  menuItem   MenuItem?  @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+
+  @@index([guestOrderId])
+  @@map("guest_order_items")
+}
+
+// ----------------------------------------------------------------------------
+// Audit log — every admin/operator change
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id         Int      @id @default(autoincrement())
+  actorId    String?  @map("actor_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id")
+  message    String
+  meta       Json?
+  ip         String?
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
