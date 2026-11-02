@@ -32,5 +32,8 @@ end-to-end pass in Chrome as Staff, Guest, Operator and Admin at desktop,
 * **Operator accounts** for the canteen team (Admin → Staff Management).
 * **Data clean-up before launch:** Plantain price (₦50), "Ofada rice and egg"
   vs "Ofada rice & stew" naming, the duplicate "Joseph Adeyeye" entries.
+* **Spec gaps** from the v63 Technical Project Guide — see
+  `docs/SPEC_GAP_CHECK.md` (DB CHECK constraints, CSP header, sign-in audit,
+  audit-log viewer, exports, and the decisions in its last section).
 * Optional: let Admins edit the bank account shown for top-ups (currently set
   in the database / seed only).
